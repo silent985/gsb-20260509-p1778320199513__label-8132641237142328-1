@@ -17,7 +17,9 @@ const ChatArea: React.FC<ChatAreaProps> = ({ onDrawerToggle }) => {
     streamingContent,
     error,
     usage,
-    config
+    config,
+    hasValidUsage,
+    clearError
   } = useChat();
 
   const [inputValue, setInputValue] = useState('');
@@ -122,20 +124,22 @@ const ChatArea: React.FC<ChatAreaProps> = ({ onDrawerToggle }) => {
 
       {/* Error Banner */}
       {error && (
-        <Alert severity="error" onClose={() => { }} sx={{ mx: 2, mb: 1 }}>{error}</Alert>
+        <Alert severity="error" onClose={clearError} sx={{ mx: 2, mb: 1 }}>{error}</Alert>
       )}
 
       {/* Stats */}
-      {!isLoading && (
+      {!isLoading && hasValidUsage && (
         <Box sx={{ display: 'flex', flexDirection: { xs: 'column', sm: 'row' }, justifyContent: 'center', alignItems: 'center', gap: { xs: 1, sm: 4 }, mb: 1, p: 1 }}>
           {usage.totalTime > 0 && (
             <Typography variant="caption" sx={{ color: 'text.secondary', textAlign: 'center' }}>
               响应耗时: {(usage.totalTime / 1000).toFixed(2)}s
             </Typography>
           )}
-          <Typography variant="caption" sx={{ color: 'text.secondary', textAlign: 'center' }}>
-            剩余用量: {usage.totalTokens ? `${Math.max(0, config.maxTokens - usage.totalTokens)}/${config.maxTokens}` : `${config.maxTokens}/${config.maxTokens}`}
-          </Typography>
+          {usage.totalTokens !== undefined && (
+            <Typography variant="caption" sx={{ color: 'text.secondary', textAlign: 'center' }}>
+              Token 用量: {usage.totalTokens} / {config.maxTokens}
+            </Typography>
+          )}
         </Box>
       )}
 
