@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { Box, CssBaseline, ThemeProvider, createTheme } from '@mui/material';
+import { useState } from 'react';
+import { Box, CssBaseline } from '@mui/material';
 import Sidebar from './components/Sidebar';
 import ChatArea from './components/ChatArea';
 

@@ -22,8 +22,7 @@ import {
   Add as AddIcon,
   ChatBubbleOutline as ChatIcon,
   Delete as DeleteIcon,
-  Settings as SettingsIcon,
-  Menu as MenuIcon
+  Settings as SettingsIcon
 } from '@mui/icons-material';
 import { useChat } from '../context/ChatContext';
 import ConfigPanel from './ConfigPanel';
