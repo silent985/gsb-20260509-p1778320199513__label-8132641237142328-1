@@ -1,7 +1,15 @@
-import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
-import { v4 as uuidv4 } from 'uuid';
-import { ChatSession, Message, UserConfig, ChatState } from '../types';
-import OpenAI from 'openai';
+import { createContext, useContext, useState, useEffect, useCallback, ReactNode } from 'react';
+import { ChatSession, UserConfig, ChatState } from '../types';
+import { loadSessions, saveSessions, loadConfig, saveConfig } from '../services/storage';
+import {
+  createSession,
+  createUserMessage,
+  appendMessage,
+  extractHistory,
+  sendChatMessage,
+  ChatResult,
+} from '../services/chatApi';
+import { formatApiError } from '../services/errorHandler';
 
 interface ChatContextType extends ChatState {
   setConfig: (config: Partial<UserConfig>) => void;
@@ -15,240 +23,134 @@ interface ChatContextType extends ChatState {
 
 const ChatContext = createContext<ChatContextType | undefined>(undefined);
 
-const DEFAULT_CONFIG: UserConfig = {
-  apiKey: '',
-  model: 'deepseek-ai/DeepSeek-R1-0528-Qwen3-8B',
-  temperature: 0.7,
-  maxTokens: 2000,
-  baseUrl: 'https://api.siliconflow.cn/v1' // SiliconFlow 基础 URL
-};
-
-const STORAGE_KEY = 'ai-chat-data';
-
-export const ChatProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
-  // Load initial state from local storage or defaults
-  const [sessions, setSessions] = useState<ChatSession[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      return saved ? JSON.parse(saved).sessions || [] : [];
-    } catch (e) {
-      console.error("Failed to parse sessions", e);
-      return [];
-    }
-  });
-
-  const [currentSessionId, setCurrentSessionId] = useState<string | null>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      return saved ? JSON.parse(saved).currentSessionId || null : null;
-    } catch (e) {
-      return null;
-    }
-  });
-
-  const [config, setConfigState] = useState<UserConfig>(() => {
-    try {
-      const saved = localStorage.getItem('ai-chat-config');
-      return saved ? JSON.parse(saved) : DEFAULT_CONFIG;
-    } catch (e) {
-      return DEFAULT_CONFIG;
-    }
-  });
-
+export const ChatProvider = ({ children }: { children: ReactNode }) => {
+  const [sessions, setSessions] = useState<ChatSession[]>(() => loadSessions().sessions);
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(
+    () => loadSessions().currentSessionId,
+  );
+  const [config, setConfigState] = useState<UserConfig>(() => loadConfig());
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [streamingContent, setStreamingContent] = useState('');
-  const [usage, setUsage] = useState<ChatState['usage']>({ startTime: 0, endTime: 0, totalTime: 0 });
+  const [lastResult, setLastResult] = useState<ChatResult | null>(null);
 
-  // Persist sessions
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ sessions, currentSessionId }));
+    saveSessions(sessions, currentSessionId);
   }, [sessions, currentSessionId]);
 
-  // Persist config
   useEffect(() => {
-    localStorage.setItem('ai-chat-config', JSON.stringify(config));
+    saveConfig(config);
   }, [config]);
 
-  const setConfig = (newConfig: Partial<UserConfig>) => {
-    setConfigState(prev => ({ ...prev, ...newConfig }));
-  };
+  const setConfig = useCallback((partial: Partial<UserConfig>) => {
+    setConfigState(prev => ({ ...prev, ...partial }));
+  }, []);
 
-  const createNewSession = () => {
-    const newSession: ChatSession = {
-      id: uuidv4(),
-      title: 'New Chat',
-      messages: [],
-      createdAt: Date.now(),
-      updatedAt: Date.now()
-    };
-    setSessions(prev => [newSession, ...prev]);
-    setCurrentSessionId(newSession.id);
-  };
+  const createNewSession = useCallback(() => {
+    const session = createSession('New Chat');
+    setSessions(prev => [session, ...prev]);
+    setCurrentSessionId(session.id);
+  }, []);
 
-  const selectSession = (id: string) => {
+  const selectSession = useCallback((id: string) => {
     setCurrentSessionId(id);
     setStreamingContent('');
     setError(null);
-  };
+  }, []);
 
-  const deleteSession = (id: string) => {
-    setSessions(prev => prev.filter(s => s.id !== id));
-    if (currentSessionId === id) {
-      setCurrentSessionId(null);
-    }
-  };
-
-  const updateCurrentMessage = (content: string) => {
-    // 手动更新消息的辅助函数（在流式逻辑中很少使用）
-  };
-
-  const clearError = () => setError(null);
-
-  const sendMessage = async (content: string) => {
-    if (!content.trim()) return;
-    if (!config.apiKey) {
-      setError('请在配置中输入您的 API 密钥。');
-      return;
-    }
-
-    let activeSessionId = currentSessionId;
-    if (!activeSessionId) {
-      const newSession: ChatSession = {
-        id: uuidv4(),
-        title: content.slice(0, 30) || 'New Chat',
-        messages: [],
-        createdAt: Date.now(),
-        updatedAt: Date.now()
-      };
-      setSessions(prev => [newSession, ...prev]);
-      setCurrentSessionId(newSession.id);
-      activeSessionId = newSession.id;
-    }
-
-    const userMessage: Message = {
-      id: uuidv4(),
-      role: 'user',
-      content,
-      timestamp: Date.now()
-    };
-
-    // Optimistic update
-    setSessions(prev => prev.map(s => {
-      if (s.id === activeSessionId) {
-        return { ...s, messages: [...s.messages, userMessage], updatedAt: Date.now() };
+  const deleteSession = useCallback(
+    (id: string) => {
+      setSessions(prev => prev.filter(s => s.id !== id));
+      if (currentSessionId === id) {
+        setCurrentSessionId(null);
       }
-      return s;
-    }));
+    },
+    [currentSessionId],
+  );
 
-    setIsLoading(true);
-    setError(null);
-    setStreamingContent('');
-    const startTime = Date.now();
-    let promptTokens = 0;
-    let completionTokens = 0;
-    let totalTokens = 0;
-    setUsage({ startTime, endTime: 0, totalTime: 0 });
+  const updateCurrentMessage = useCallback((_content: string) => {}, []);
 
-    try {
-      const openai = new OpenAI({
-        apiKey: config.apiKey,
-        baseURL: config.baseUrl,
-        dangerouslyAllowBrowser: true // Client-side only requirement
-      });
+  const clearError = useCallback(() => setError(null), []);
 
-      // Prepare history
-      const currentSession = sessions.find(s => s.id === activeSessionId);
-      const history = currentSession ? currentSession.messages.map(m => ({ role: m.role, content: m.content })) : [];
-
-      const stream = await openai.chat.completions.create({
-        model: config.model,
-        messages: [...history, { role: 'user', content }] as any,
-        temperature: config.temperature,
-        max_tokens: config.maxTokens,
-        stream: true,
-      });
-
-      let fullResponse = '';
-
-      for await (const chunk of stream) {
-        const delta = chunk.choices[0]?.delta?.content || '';
-        if (delta) {
-          fullResponse += delta;
-          setStreamingContent(fullResponse);
-        }
-        // Check if chunk contains usage information (usually in the last chunk)
-        if (chunk.usage) {
-          promptTokens = chunk.usage.prompt_tokens || 0;
-          completionTokens = chunk.usage.completion_tokens || 0;
-          totalTokens = chunk.usage.total_tokens || 0;
-        }
+  const sendMessage = useCallback(
+    async (content: string) => {
+      if (!content.trim()) return;
+      if (!config.apiKey) {
+        setError('请在配置中输入您的 API 密钥。');
+        return;
       }
 
-      // Finalize message
-      const assistantMessage: Message = {
-        id: uuidv4(),
-        role: 'assistant',
-        content: fullResponse,
-        timestamp: Date.now()
-      };
+      let activeSessionId = currentSessionId;
+      if (!activeSessionId) {
+        const session = createSession(content.slice(0, 30) || 'New Chat');
+        setSessions(prev => [session, ...prev]);
+        setCurrentSessionId(session.id);
+        activeSessionId = session.id;
+      }
 
-      setSessions(prev => prev.map(s => {
-        if (s.id === activeSessionId) {
-          return { ...s, messages: [...s.messages, assistantMessage], updatedAt: Date.now() };
-        }
-        return s;
-      }));
+      const targetId = activeSessionId;
+      const userMsg = createUserMessage(content);
+
+      setSessions(prev => appendMessage(prev, targetId, userMsg));
+      setIsLoading(true);
+      setError(null);
       setStreamingContent('');
+      setLastResult(null);
 
-    } catch (err: any) {
-      console.error('API Error:', err);
-      let errorMessage = '发送消息失败';
-      if (err.status === 403) {
-        errorMessage = '403 错误：API 密钥无效或无权限，请检查配置';
-      } else if (err.status === 401) {
-        errorMessage = '401 错误：API 密钥未授权，请检查配置';
-      } else if (err.status === 429) {
-        errorMessage = '429 错误：API 请求过于频繁，请稍后再试';
-      } else if (err.code === 30001) {
-        errorMessage = '账户余额不足，请充值后再试';
-      } else if (err.error?.code === 30001) {
-        errorMessage = '账户余额不足，请充值后再试';
-      } else if (err.message) {
-        errorMessage = err.message;
+      try {
+        const currentSession = sessions.find(s => s.id === targetId);
+        const history = extractHistory(currentSession);
+
+        const result = await sendChatMessage({
+          config,
+          history,
+          userContent: content,
+          onChunk: accumulated => setStreamingContent(accumulated),
+        });
+
+        setSessions(prev => appendMessage(prev, targetId, result.assistantMessage));
+        setStreamingContent('');
+        setLastResult(result);
+      } catch (err: any) {
+        console.error('API Error:', err);
+        setError(formatApiError(err));
+      } finally {
+        setIsLoading(false);
       }
-      setError(errorMessage);
-    } finally {
-      setIsLoading(false);
-      const endTime = Date.now();
-      setUsage(prev => ({
-        ...prev,
-        endTime,
-        totalTime: endTime - startTime,
-        promptTokens,
-        completionTokens,
-        totalTokens
-      }));
-    }
-  };
+    },
+    [config, currentSessionId, sessions],
+  );
+
+  const usage: ChatState['usage'] = lastResult
+    ? {
+        startTime: lastResult.timing.startTime,
+        endTime: lastResult.timing.endTime,
+        totalTime: lastResult.timing.totalTime,
+        promptTokens: lastResult.usage.promptTokens,
+        completionTokens: lastResult.usage.completionTokens,
+        totalTokens: lastResult.usage.totalTokens,
+      }
+    : { startTime: 0, endTime: 0, totalTime: 0 };
 
   return (
-    <ChatContext.Provider value={{
-      sessions,
-      currentSessionId,
-      config,
-      isLoading,
-      error,
-      streamingContent,
-      usage,
-      setConfig,
-      createNewSession,
-      selectSession,
-      deleteSession,
-      sendMessage,
-      updateCurrentMessage,
-      clearError
-    }}>
+    <ChatContext.Provider
+      value={{
+        sessions,
+        currentSessionId,
+        config,
+        isLoading,
+        error,
+        streamingContent,
+        usage,
+        setConfig,
+        createNewSession,
+        selectSession,
+        deleteSession,
+        sendMessage,
+        updateCurrentMessage,
+        clearError,
+      }}
+    >
       {children}
     </ChatContext.Provider>
   );
