@@ -1,7 +1,9 @@
 import React, { createContext, useContext, useState, useEffect, ReactNode } from 'react';
 import { v4 as uuidv4 } from 'uuid';
 import { ChatSession, Message, UserConfig, ChatState } from '../types';
-import OpenAI from 'openai';
+import { loadChatData, saveChatData, loadConfig, saveConfig } from '../utils/storage';
+import { sendChatMessage, StreamTokenInfo } from '../services/chatApi';
+import { mapAPIError, APIError } from '../utils/errors';
 
 interface ChatContextType extends ChatState {
   setConfig: (config: Partial<UserConfig>) => void;
@@ -20,54 +22,24 @@ const DEFAULT_CONFIG: UserConfig = {
   model: 'deepseek-ai/DeepSeek-R1-0528-Qwen3-8B',
   temperature: 0.7,
   maxTokens: 2000,
-  baseUrl: 'https://api.siliconflow.cn/v1' // SiliconFlow 基础 URL
+  baseUrl: 'https://api.siliconflow.cn/v1',
 };
 
-const STORAGE_KEY = 'ai-chat-data';
-
 export const ChatProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
-  // Load initial state from local storage or defaults
-  const [sessions, setSessions] = useState<ChatSession[]>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      return saved ? JSON.parse(saved).sessions || [] : [];
-    } catch (e) {
-      console.error("Failed to parse sessions", e);
-      return [];
-    }
-  });
-
-  const [currentSessionId, setCurrentSessionId] = useState<string | null>(() => {
-    try {
-      const saved = localStorage.getItem(STORAGE_KEY);
-      return saved ? JSON.parse(saved).currentSessionId || null : null;
-    } catch (e) {
-      return null;
-    }
-  });
-
-  const [config, setConfigState] = useState<UserConfig>(() => {
-    try {
-      const saved = localStorage.getItem('ai-chat-config');
-      return saved ? JSON.parse(saved) : DEFAULT_CONFIG;
-    } catch (e) {
-      return DEFAULT_CONFIG;
-    }
-  });
-
+  const [sessions, setSessions] = useState<ChatSession[]>(() => loadChatData().sessions);
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(() => loadChatData().currentSessionId);
+  const [config, setConfigState] = useState<UserConfig>(() => loadConfig(DEFAULT_CONFIG));
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [streamingContent, setStreamingContent] = useState('');
   const [usage, setUsage] = useState<ChatState['usage']>({ startTime: 0, endTime: 0, totalTime: 0 });
 
-  // Persist sessions
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ sessions, currentSessionId }));
+    saveChatData({ sessions, currentSessionId });
   }, [sessions, currentSessionId]);
 
-  // Persist config
   useEffect(() => {
-    localStorage.setItem('ai-chat-config', JSON.stringify(config));
+    saveConfig(config);
   }, [config]);
 
   const setConfig = (newConfig: Partial<UserConfig>) => {
@@ -80,7 +52,7 @@ export const ChatProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       title: 'New Chat',
       messages: [],
       createdAt: Date.now(),
-      updatedAt: Date.now()
+      updatedAt: Date.now(),
     };
     setSessions(prev => [newSession, ...prev]);
     setCurrentSessionId(newSession.id);
@@ -99,11 +71,73 @@ export const ChatProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
     }
   };
 
-  const updateCurrentMessage = (content: string) => {
-    // 手动更新消息的辅助函数（在流式逻辑中很少使用）
+  const updateCurrentMessage = (_content: string) => {
   };
 
   const clearError = () => setError(null);
+
+  const ensureSession = (content: string): string => {
+    if (currentSessionId) {
+      return currentSessionId;
+    }
+    const newSession: ChatSession = {
+      id: uuidv4(),
+      title: content.slice(0, 30) || 'New Chat',
+      messages: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    setSessions(prev => [newSession, ...prev]);
+    setCurrentSessionId(newSession.id);
+    return newSession.id;
+  };
+
+  const addMessage = (sessionId: string, message: Message) => {
+    setSessions(prev => prev.map(s => {
+      if (s.id === sessionId) {
+        return { ...s, messages: [...s.messages, message], updatedAt: Date.now() };
+      }
+      return s;
+    }));
+  };
+
+  const getHistoryForSession = (sessionsList: ChatSession[], sessionId: string, extraMessage?: Message): Message[] => {
+    const currentSession = sessionsList.find(s => s.id === sessionId);
+    const history = currentSession ? [...currentSession.messages] : [];
+    if (extraMessage) {
+      history.push(extraMessage);
+    }
+    return history;
+  };
+
+  const handleStreamToken = (delta: string, accumulated: string): string => {
+    const newContent = accumulated + delta;
+    setStreamingContent(newContent);
+    return newContent;
+  };
+
+  const finalizeAssistantMessage = (sessionId: string, content: string) => {
+    const assistantMessage: Message = {
+      id: uuidv4(),
+      role: 'assistant',
+      content,
+      timestamp: Date.now(),
+    };
+    addMessage(sessionId, assistantMessage);
+    setStreamingContent('');
+  };
+
+  const updateUsageStats = (startTime: number, tokenInfo: StreamTokenInfo) => {
+    const endTime = Date.now();
+    setUsage({
+      startTime,
+      endTime,
+      totalTime: endTime - startTime,
+      promptTokens: tokenInfo.promptTokens,
+      completionTokens: tokenInfo.completionTokens,
+      totalTokens: tokenInfo.totalTokens,
+    });
+  };
 
   const sendMessage = async (content: string) => {
     if (!content.trim()) return;
@@ -112,123 +146,41 @@ export const ChatProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       return;
     }
 
-    let activeSessionId = currentSessionId;
-    if (!activeSessionId) {
-      const newSession: ChatSession = {
-        id: uuidv4(),
-        title: content.slice(0, 30) || 'New Chat',
-        messages: [],
-        createdAt: Date.now(),
-        updatedAt: Date.now()
-      };
-      setSessions(prev => [newSession, ...prev]);
-      setCurrentSessionId(newSession.id);
-      activeSessionId = newSession.id;
-    }
+    const activeSessionId = ensureSession(content);
 
     const userMessage: Message = {
       id: uuidv4(),
       role: 'user',
       content,
-      timestamp: Date.now()
+      timestamp: Date.now(),
     };
-
-    // Optimistic update
-    setSessions(prev => prev.map(s => {
-      if (s.id === activeSessionId) {
-        return { ...s, messages: [...s.messages, userMessage], updatedAt: Date.now() };
-      }
-      return s;
-    }));
+    addMessage(activeSessionId, userMessage);
 
     setIsLoading(true);
     setError(null);
     setStreamingContent('');
     const startTime = Date.now();
-    let promptTokens = 0;
-    let completionTokens = 0;
-    let totalTokens = 0;
     setUsage({ startTime, endTime: 0, totalTime: 0 });
 
+    let accumulatedContent = '';
+
     try {
-      const openai = new OpenAI({
-        apiKey: config.apiKey,
-        baseURL: config.baseUrl,
-        dangerouslyAllowBrowser: true // Client-side only requirement
+      const history = getHistoryForSession(sessions, activeSessionId, userMessage);
+
+      const tokenInfo = await sendChatMessage(config, history, {
+        onToken: (delta) => {
+          accumulatedContent = handleStreamToken(delta, accumulatedContent);
+        },
+        onComplete: () => {},
       });
 
-      // Prepare history
-      const currentSession = sessions.find(s => s.id === activeSessionId);
-      const history = currentSession ? currentSession.messages.map(m => ({ role: m.role, content: m.content })) : [];
-
-      const stream = await openai.chat.completions.create({
-        model: config.model,
-        messages: [...history, { role: 'user', content }] as any,
-        temperature: config.temperature,
-        max_tokens: config.maxTokens,
-        stream: true,
-      });
-
-      let fullResponse = '';
-
-      for await (const chunk of stream) {
-        const delta = chunk.choices[0]?.delta?.content || '';
-        if (delta) {
-          fullResponse += delta;
-          setStreamingContent(fullResponse);
-        }
-        // Check if chunk contains usage information (usually in the last chunk)
-        if (chunk.usage) {
-          promptTokens = chunk.usage.prompt_tokens || 0;
-          completionTokens = chunk.usage.completion_tokens || 0;
-          totalTokens = chunk.usage.total_tokens || 0;
-        }
-      }
-
-      // Finalize message
-      const assistantMessage: Message = {
-        id: uuidv4(),
-        role: 'assistant',
-        content: fullResponse,
-        timestamp: Date.now()
-      };
-
-      setSessions(prev => prev.map(s => {
-        if (s.id === activeSessionId) {
-          return { ...s, messages: [...s.messages, assistantMessage], updatedAt: Date.now() };
-        }
-        return s;
-      }));
-      setStreamingContent('');
-
-    } catch (err: any) {
+      finalizeAssistantMessage(activeSessionId, accumulatedContent);
+      updateUsageStats(startTime, tokenInfo);
+    } catch (err) {
       console.error('API Error:', err);
-      let errorMessage = '发送消息失败';
-      if (err.status === 403) {
-        errorMessage = '403 错误：API 密钥无效或无权限，请检查配置';
-      } else if (err.status === 401) {
-        errorMessage = '401 错误：API 密钥未授权，请检查配置';
-      } else if (err.status === 429) {
-        errorMessage = '429 错误：API 请求过于频繁，请稍后再试';
-      } else if (err.code === 30001) {
-        errorMessage = '账户余额不足，请充值后再试';
-      } else if (err.error?.code === 30001) {
-        errorMessage = '账户余额不足，请充值后再试';
-      } else if (err.message) {
-        errorMessage = err.message;
-      }
-      setError(errorMessage);
+      setError(mapAPIError(err as APIError));
     } finally {
       setIsLoading(false);
-      const endTime = Date.now();
-      setUsage(prev => ({
-        ...prev,
-        endTime,
-        totalTime: endTime - startTime,
-        promptTokens,
-        completionTokens,
-        totalTokens
-      }));
     }
   };
 
@@ -247,7 +199,7 @@ export const ChatProvider: React.FC<{ children: ReactNode }> = ({ children }) =>
       deleteSession,
       sendMessage,
       updateCurrentMessage,
-      clearError
+      clearError,
     }}>
       {children}
     </ChatContext.Provider>
